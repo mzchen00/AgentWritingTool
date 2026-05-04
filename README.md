@@ -2,7 +2,7 @@
 
 A research prototype for studying how users collaborate with AI writing agents. The system guides users through a multi-step article writing process, enabling real-time intervention, content editing, and transparent agent control at every stage.
 
-**Stack:** React · Tailwind CSS · Node.js/Express · Python/FastAPI · Playwright · OpenAI GPT-4o (streaming)
+**Stack:** React · Tailwind CSS · Node.js/Express · Python/FastAPI · Playwright · OpenAI GPT 5.4mini 
 
 ---
 
