@@ -32,11 +32,43 @@ function Section({ title, children }) {
 
 export default function AnalyticsReport({ report, onClose }) {
   const [showRaw, setShowRaw] = useState(false);
+  const [copied, setCopied] = useState(false);
   const { summary, events } = report;
   const s = summary;
 
+  const buildSummary = () => {
+    const parts = [];
+    if (s.prompt) parts.push(`Prompt: "${s.prompt}"`);
+    parts.push(`Duration: ${fmtMs(s.sessionDurationMs)}`);
+    const stepSummary = s.steps.map(st => `${st.name}=${st.outcome ?? '—'}${st.reviewWaitMs != null ? `(${fmtMs(st.reviewWaitMs)})` : ''}`).join(', ');
+    if (stepSummary) parts.push(`Steps: ${stepSummary}`);
+    parts.push(`Paused ${s.controls.pauses}x, skipped ${s.controls.stepsSkipped} steps`);
+    parts.push(`Edits: ${s.editing.manualEditsTotal} manual (intro ${s.editing.manualEditsBySection.introduction} body ${s.editing.manualEditsBySection.body} concl ${s.editing.manualEditsBySection.conclusion}), ${s.editing.aiRewritesTotal} AI rewrites`);
+    if (s.editing.rewriteInstructions.length > 0) parts.push(`Rewrite instructions: ${s.editing.rewriteInstructions.join(' | ')}`);
+    parts.push(`Plan: ${s.plan.modifications} mods, rewrite ${s.plan.rewriteTriggered}x${s.plan.modifiedFields.length ? ` [${s.plan.modifiedFields.join(',')}]` : ''}`);
+    parts.push(`Personas: ${s.personas.editCount} edits${s.personas.agentsEdited.length ? ` [${s.personas.agentsEdited.join(',')}]` : ''}`);
+    if (s.search) parts.push(`Search: ${s.search.sourcesSelected} sources, ${s.search.pagesVisited?.length ?? 0} pages, ${s.search.imagesSelected} images, reviewed ${fmtMs(s.search.waitMs)}`);
+    parts.push(`Review: ${s.review.applied ? 'applied' : s.review.skipped ? 'skipped' : '—'}${s.review.waitMs != null ? ` (${fmtMs(s.review.waitMs)})` : ''}`);
+    parts.push(`Images: ${s.images.pasted} pasted`);
+    parts.push(`AutoMode: ${s.autoMode?.everEnabled ? 'yes' : 'no'}, toggled ${s.autoMode?.toggleCount ?? 0}x`);
+    return parts.join(' | ');
+  };
+
   const copyJson = () => {
-    navigator.clipboard.writeText(JSON.stringify(report, null, 2));
+    const text = buildSummary();
+    const el = document.createElement('textarea');
+    el.value = text;
+    el.style.position = 'fixed';
+    el.style.top = '0';
+    el.style.left = '0';
+    el.style.opacity = '0';
+    document.body.appendChild(el);
+    el.focus();
+    el.select();
+    document.execCommand('copy');
+    document.body.removeChild(el);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
   return (
@@ -66,17 +98,26 @@ export default function AnalyticsReport({ report, onClose }) {
             <Row label="Duration" value={fmtMs(s.sessionDurationMs)} />
           </Section>
 
-          <Section title="Step review times">
+          <Section title="Step timings">
             {s.steps.map(step => (
-              <Row
-                key={step.step}
-                label={step.name}
-                value={
-                  step.outcome === 'approved' ? '✓ Approved' :
-                  step.outcome === 'skipped'  ? '⏭ Skipped'  : '—'
-                }
-                sub={step.reviewWaitMs != null ? `waited ${fmtMs(step.reviewWaitMs)}` : null}
-              />
+              <div key={step.step} className="flex items-baseline justify-between py-1.5 border-b border-gray-100 last:border-0 gap-2">
+                <span className="text-sm text-gray-600 flex-shrink-0">{step.name}</span>
+                <div className="flex items-baseline gap-3 text-right">
+                  {step.generationMs != null && (
+                    <span className="text-xs text-gray-400">
+                      AI <span className="font-semibold text-gray-700">{fmtMs(step.generationMs)}</span>
+                    </span>
+                  )}
+                  {step.reviewWaitMs != null && (
+                    <span className="text-xs text-gray-400">
+                      wait <span className="font-semibold text-gray-700">{fmtMs(step.reviewWaitMs)}</span>
+                    </span>
+                  )}
+                  <span className="text-xs font-semibold text-gray-500">
+                    {step.outcome === 'approved' ? '✓' : step.outcome === 'skipped' ? '⏭' : '—'}
+                  </span>
+                </div>
+              </div>
             ))}
           </Section>
 
@@ -191,11 +232,26 @@ export default function AnalyticsReport({ report, onClose }) {
         {/* Footer */}
         <div className="flex items-center justify-between px-6 py-3 border-t border-gray-100 flex-shrink-0 bg-gray-50">
           <button onClick={copyJson}
-            className="flex items-center gap-1.5 text-xs font-semibold text-gray-600 bg-white border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-100 transition">
-            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
-            </svg>
-            Copy JSON
+            className={`flex items-center gap-1.5 text-xs font-semibold rounded-lg px-3 py-1.5 transition ${
+              copied
+                ? 'text-emerald-700 bg-emerald-50 border border-emerald-200'
+                : 'text-gray-600 bg-white border border-gray-200 hover:bg-gray-100'
+            }`}>
+            {copied ? (
+              <>
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+                </svg>
+                Copied!
+              </>
+            ) : (
+              <>
+                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                </svg>
+                Copy Summary
+              </>
+            )}
           </button>
           <button onClick={onClose}
             className="text-xs font-semibold bg-blue-600 text-white rounded-lg px-4 py-1.5 hover:bg-blue-700 transition">

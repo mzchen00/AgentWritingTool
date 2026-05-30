@@ -222,7 +222,7 @@ function SearchSection({ results, images, onConfirm, autoConfirmed, agentStatus,
 
   // Mirror external confirmation (e.g. auto-mode bypasses the button)
   useEffect(() => {
-    if (!confirmed && agentStatus !== 'search_review') setConfirmed(true);
+    if (!confirmed && agentStatus !== 'search_review' && agentStatus !== 'paused') setConfirmed(true);
   }, [agentStatus]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // When real scraped images arrive, select them all by default
@@ -487,6 +487,15 @@ export default function WorkspacePanel({
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const scrollRef = useRef(null);
+
+  // Auto-collapse during writing steps; auto-expand during planning/search
+  useEffect(() => {
+    if (currentStep >= 2 && currentStep <= 4) {
+      setCollapsed(true);
+    } else if (currentStep === 0 || currentStep === 1) {
+      setCollapsed(false);
+    }
+  }, [currentStep]);
 
   const isPlanning      = currentStep === 0 && agentStatus === 'running';
   const isPlanReady     = currentStep === 0 && agentStatus === 'waiting_approval' && !!outline;

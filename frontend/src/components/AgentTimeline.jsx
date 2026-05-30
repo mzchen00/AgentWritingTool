@@ -3,19 +3,21 @@ import { useState } from 'react';
 // ── Persona definitions ───────────────────────────────────────
 export const DEFAULT_PERSONAS = {
   planner: {
-    name: 'Alex', role: 'Strategic Planner', emoji: '🧠', color: 'blue',
+    name: 'Alex', role: 'Strategic Planner', emoji: '📋', color: 'blue',
     description: 'Analytical and methodical. Identifies core themes and structures a logical outline with appropriate depth for the target audience.',
   },
   search: {
     name: 'Scout', role: 'Research Agent', emoji: '🔍', color: 'purple',
     description: 'Thorough and discerning. Prioritises authoritative, relevant sources and surfaces key facts and context.',
+    searchKeywords: '',
+    maxResults: 5,
   },
   writer: {
     name: 'Maya', role: 'Writer Agent', emoji: '✍️', color: 'green',
     description: 'Clear and engaging. Adapts voice and structure to the content type, balancing detail with readability.',
   },
   reviewer: {
-    name: 'Kai', role: 'Reviewer Agent', emoji: '👁️', color: 'amber',
+    name: 'Kai', role: 'Reviewer Agent', emoji: '✏️', color: 'amber',
     description: 'Precise and constructive. Tightens structure, improves clarity, and ensures consistency of tone throughout.',
   },
 };
@@ -59,7 +61,7 @@ function TypingDots() {
 // ── Single Persona Card ───────────────────────────────────────
 function PersonaCard({ type, persona, isActive, agentStatus, stepMsg, onEdit, isDone, canRestart, onRestartFrom, prompt }) {
   const [panel, setPanel]   = useState(null); // null | 'edit' | 'rerun'
-  const [draft, setDraft]   = useState({ name: persona.name, role: persona.role, description: persona.description || '' });
+  const [draft, setDraft]   = useState({ name: persona.name, role: persona.role, description: persona.description || '', searchKeywords: persona.searchKeywords || '', maxResults: persona.maxResults ?? 5 });
   const [promptDraft, setPromptDraft] = useState(prompt || '');
   const p = PALETTE[persona.color] || PALETTE.blue;
   const rerun = AGENT_RERUN[type];
@@ -69,11 +71,16 @@ function PersonaCard({ type, persona, isActive, agentStatus, stepMsg, onEdit, is
   const isComplete = !isActive && agentStatus === 'completed';
 
   const openEdit = () => {
-    setDraft({ name: persona.name, role: persona.role, description: persona.description || '' });
+    setDraft({ name: persona.name, role: persona.role, description: persona.description || '', searchKeywords: persona.searchKeywords || '', maxResults: persona.maxResults ?? 5 });
     setPanel(panel === 'edit' ? null : 'edit');
   };
   const saveEdit = () => {
-    onEdit(type, { name: draft.name.trim() || persona.name, role: draft.role.trim() || persona.role, description: draft.description });
+    const saved = { name: draft.name.trim() || persona.name, role: draft.role.trim() || persona.role, description: draft.description };
+    if (type === 'search') {
+      saved.searchKeywords = draft.searchKeywords;
+      saved.maxResults = Math.min(10, Math.max(1, Number(draft.maxResults) || 5));
+    }
+    onEdit(type, saved);
     setPanel(null);
   };
 
@@ -193,6 +200,37 @@ function PersonaCard({ type, persona, isActive, agentStatus, stepMsg, onEdit, is
               className="w-full text-xs border border-gray-200 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-blue-400 resize-none leading-relaxed"
             />
           </div>
+
+          {type === 'search' && (
+            <>
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">
+                  Extra Search Keywords <span className="normal-case font-normal text-gray-300">(appended to every Tavily query)</span>
+                </label>
+                <input
+                  value={draft.searchKeywords}
+                  onChange={e => setDraft(d => ({ ...d, searchKeywords: e.target.value }))}
+                  onKeyDown={e => { if (e.key === 'Enter') saveEdit(); if (e.key === 'Escape') setPanel(null); }}
+                  placeholder="e.g. Melbourne site:.com.au -reddit"
+                  className="w-full text-xs border border-gray-200 rounded-lg px-2 py-1.5 focus:outline-none focus:ring-2 focus:ring-purple-400"
+                />
+              </div>
+              <div>
+                <label className="block text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-1">
+                  Number of Results <span className="normal-case font-normal text-gray-300 ml-1">{draft.maxResults}</span>
+                </label>
+                <input
+                  type="range" min={5} max={10} step={1}
+                  value={draft.maxResults}
+                  onChange={e => setDraft(d => ({ ...d, maxResults: Number(e.target.value) }))}
+                  className="w-full accent-purple-600"
+                />
+                <div className="flex justify-between text-[10px] text-gray-300 mt-0.5">
+                  <span>5</span><span>10</span>
+                </div>
+              </div>
+            </>
+          )}
 
           <div className="flex gap-2">
             <button onClick={saveEdit}
@@ -812,8 +850,10 @@ export default function AgentTimeline({
                 ? (multiAgent === type || (!multiAgent && type === 'writer'))
                 : type === agentType;
               const doneStep = AGENT_DONE_STEP[type];
-              const isDone = steps[doneStep]?.status === 'completed';
-              const canRestart = isDone && !['running', 'search_review', 'waiting_approval'].includes(agentStatus);
+              const isPausedHere = agentStatus === 'paused' && STEP_AGENT[currentStep] === type;
+              const isDone = steps[doneStep]?.status === 'completed' || isPausedHere;
+              const canRestart = isDone &&
+                !['running', 'search_review', 'waiting_approval'].includes(agentStatus);
               return (
                 <PersonaCard
                   key={type}
@@ -835,7 +875,7 @@ export default function AgentTimeline({
 
         {/* ── Content Plan ── */}
         <div>
-          <p className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider mb-2">Content Plan</p>
+          <p className="text-sm font-bold text-gray-600 uppercase tracking-widest mb-2">Content Plan</p>
           <ContentPlan
             outline={outline}
             currentStep={currentStep}

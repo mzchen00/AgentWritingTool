@@ -26,7 +26,6 @@ function startScraper() {
   });
   proc.on('error', err => console.error('[scraper] failed to start:', err.message));
   process.on('exit', () => proc.kill());
-  // Poll until ready
   const poll = setInterval(() => {
     const req = http.get(`http://127.0.0.1:${SCRAPER_PORT}/health`, res => {
       if (res.statusCode === 200) { scraperReady = true; clearInterval(poll); console.log('[scraper] ready on port', SCRAPER_PORT); }
@@ -90,10 +89,13 @@ function tavilySearch(query, maxResults = 8) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Execution Controller
+// Execution Controller (one instance per session)
 // ─────────────────────────────────────────────────────────────
 class ExecutionController {
-  constructor() { this.reset(); }
+  constructor(sendEvent) {
+    this._sendEvent = sendEvent;
+    this.reset();
+  }
 
   reset() {
     this.config = null;
@@ -140,26 +142,28 @@ class ExecutionController {
   addLog(message) {
     const entry = { id: `${Date.now()}-${Math.random()}`, message, timestamp: new Date().toISOString() };
     this.logs.push(entry);
-    sendEvent('log', entry);
+    this._sendEvent('log', entry);
   }
 
   // ── Control ───────────────────────────────────────────────
   pause() {
     this.logEvent('agent_paused', { stepIndex: this.currentStep });
     this.status = 'paused';
-    sendEvent('status_update', { status: 'paused', currentStep: this.currentStep });
+    this._sendEvent('status_update', { status: 'paused', currentStep: this.currentStep });
   }
 
   resume() {
     this.logEvent('agent_resumed', { stepIndex: this.currentStep });
     if (this._approvalResolver) {
-      // Was paused while waiting for step approval — restore waiting_approval state
       this.status = 'waiting_approval';
-      sendEvent('waiting_approval', { stepIndex: this.currentStep });
-      sendEvent('status_update', { status: 'waiting_approval', currentStep: this.currentStep });
+      this._sendEvent('waiting_approval', { stepIndex: this.currentStep });
+      this._sendEvent('status_update', { status: 'waiting_approval', currentStep: this.currentStep });
+    } else if (this._searchResolver) {
+      this.status = 'search_review';
+      this._sendEvent('status_update', { status: 'search_review', currentStep: this.currentStep });
     } else {
       this.status = 'running';
-      sendEvent('status_update', { status: 'running', currentStep: this.currentStep });
+      this._sendEvent('status_update', { status: 'running', currentStep: this.currentStep });
       const rs = [...this._resumeResolvers];
       this._resumeResolvers = [];
       rs.forEach(r => r());
@@ -205,6 +209,10 @@ class ExecutionController {
     this._approvalStartTime = null;
     this.selectedSourceIds = ids;
     if (imageIds !== undefined) this.selectedImageIds = imageIds;
+    if (this.status === 'paused') {
+      this.status = 'running';
+      this._sendEvent('status_update', { status: 'running', currentStep: this.currentStep });
+    }
     if (this._searchResolver) { this._searchResolver(ids); this._searchResolver = null; }
   }
 
@@ -213,7 +221,7 @@ class ExecutionController {
     const idx = arr.findIndex(p => p.id === paragraphId);
     if (idx !== -1) {
       arr[idx].text = newText;
-      sendEvent('paragraph_updated', { section, paragraphId, text: newText });
+      this._sendEvent('paragraph_updated', { section, paragraphId, text: newText });
     }
   }
 
@@ -240,14 +248,51 @@ class ExecutionController {
   }
 }
 
-let controller = new ExecutionController();
-let sseClient = null;
+// ─────────────────────────────────────────────────────────────
+// Session management
+// ─────────────────────────────────────────────────────────────
+const sessions = new Map(); // sessionId -> { controller, sseClient, sendEvent, cleanupTimer }
+const SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
-function sendEvent(type, data) {
-  if (sseClient && !sseClient.writableEnded) {
-    try { sseClient.write(`data: ${JSON.stringify({ type, data })}\n\n`); }
-    catch (e) { console.error('SSE write error:', e.message); }
+function getOrCreateSession(sessionId) {
+  if (!sessions.has(sessionId)) {
+    const session = { sseClient: null, cleanupTimer: null, controller: null, sendEvent: null };
+
+    const sendEvent = (type, data) => {
+      const client = session.sseClient;
+      if (client && !client.writableEnded) {
+        try { client.write(`data: ${JSON.stringify({ type, data })}\n\n`); }
+        catch (e) { console.error('SSE write error:', e.message); }
+      }
+    };
+
+    session.sendEvent = sendEvent;
+    session.controller = new ExecutionController(sendEvent);
+    sessions.set(sessionId, session);
+    console.log(`[session] created ${sessionId} (total: ${sessions.size})`);
   }
+  return sessions.get(sessionId);
+}
+
+function scheduleSessionCleanup(sessionId) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+  session.cleanupTimer = setTimeout(() => {
+    const s = sessions.get(sessionId);
+    if (s && !s.sseClient) {
+      s.controller.abort();
+      sessions.delete(sessionId);
+      console.log(`[session] cleaned up ${sessionId} (remaining: ${sessions.size})`);
+    }
+  }, SESSION_TIMEOUT_MS);
+}
+
+// Extract sessionId from request and return the session, or send 400.
+function requireSession(req, res) {
+  const sessionId = req.query.sessionId || req.body?.sessionId;
+  if (!sessionId) { res.status(400).json({ error: 'sessionId required' }); return null; }
+  return getOrCreateSession(sessionId);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -265,7 +310,7 @@ const STEPS = [
 // ─────────────────────────────────────────────────────────────
 // Helper: streaming call with pause/skip support
 // ─────────────────────────────────────────────────────────────
-async function streamCall(messages, onToken, { jsonMode = false } = {}) {
+async function streamCall(controller, messages, onToken, { jsonMode = false } = {}) {
   const opts = { model: 'gpt-5.4-mini-2026-03-17', messages, stream: true };
   if (jsonMode) opts.response_format = { type: 'json_object' };
 
@@ -286,7 +331,7 @@ async function streamCall(messages, onToken, { jsonMode = false } = {}) {
 // ─────────────────────────────────────────────────────────────
 // Step: Planning
 // ─────────────────────────────────────────────────────────────
-async function executePlanning() {
+async function executePlanning(controller, sendEvent) {
   sendEvent('step_status', { stepIndex: 0, message: 'Generating document structure...' });
   controller.addLog('Agent is planning the document structure...');
 
@@ -335,9 +380,10 @@ Generate 3–5 sections.`,
     },
   ];
 
+  const stepStart = Date.now();
   try {
     let planText = '';
-    const result = await streamCall(messages, delta => {
+    const result = await streamCall(controller, messages, delta => {
       planText += delta;
       sendEvent('planning_token', { text: delta });
     }, { jsonMode: true });
@@ -347,6 +393,7 @@ Generate 3–5 sections.`,
     try { controller.outline = JSON.parse(planText); }
     catch { controller.outline = { topic: 'the topic', introduction_points: [], sections: [], conclusion_points: [] }; }
 
+    controller.logEvent('step_generation_complete', { stepIndex: 0, generationMs: Date.now() - stepStart });
     sendEvent('step_complete', { stepIndex: 0, outline: controller.outline });
     controller.addLog(`Planning complete. Document topic: ${controller.outline.topic || 'unknown'}.`);
 
@@ -369,7 +416,7 @@ Generate 3–5 sections.`,
 // ─────────────────────────────────────────────────────────────
 // Step: Web Search
 // ─────────────────────────────────────────────────────────────
-async function executeSearch() {
+async function executeSearch(controller, sendEvent, sessionId) {
   const topic = controller.outline?.topic || 'the topic';
   sendEvent('step_status', { stepIndex: 1, message: `Searching for references on: ${topic}...` });
   controller.addLog(`Searching web for: ${topic}`);
@@ -383,13 +430,15 @@ async function executeSearch() {
   const instructions = controller.consumePendingInstructions();
   const sectionNames = (controller.outline?.sections || []).slice(0, 3).map(s => s.name).join(', ');
 
-  const researcherPersona = controller.config?.personas?.researcher;
-  const researcherName    = researcherPersona?.name        || 'Sam';
-  const researcherRole    = researcherPersona?.role        || 'Research Agent';
-  const researcherDesc    = researcherPersona?.description || '';
+  const researcherPersona    = controller.config?.personas?.search || controller.config?.personas?.researcher;
+  const researcherName       = researcherPersona?.name           || 'Scout';
+  const researcherRole       = researcherPersona?.role           || 'Research Agent';
+  const researcherDesc       = researcherPersona?.description    || '';
+  const extraKeywords        = (researcherPersona?.searchKeywords || '').trim();
+  const maxResults           = Math.min(10, Math.max(5, Number(researcherPersona?.maxResults) || 5));
 
+  const stepStart = Date.now();
   try {
-    // Use the researcher persona to craft a targeted search query
     let query = `${topic} ${sectionNames}`.trim();
     const queryMessages = [
       {
@@ -407,13 +456,14 @@ Write a single web search query (under 120 characters) that will find the most u
       },
     ];
     let generatedQuery = '';
-    await streamCall(queryMessages, delta => { generatedQuery += delta; });
+    await streamCall(controller, queryMessages, delta => { generatedQuery += delta; });
     if (generatedQuery.trim()) {
       query = generatedQuery.trim().replace(/^["']|["']$/g, '');
-      controller.addLog(`Search query (by ${researcherName}): "${query}"`);
     }
+    if (extraKeywords) query = `${query} ${extraKeywords}`;
+    controller.addLog(`Search query (by ${researcherName}): "${query}"`);
 
-    const { results: tavilyRes } = await tavilySearch(query, 8);
+    const { results: tavilyRes } = await tavilySearch(query, maxResults);
 
     const results = tavilyRes.map((r, i) => ({
       id: String(i + 1),
@@ -430,6 +480,7 @@ Write a single web search query (under 120 characters) that will find the most u
     controller.selectedSourceIds = results.map(r => r.id);
     controller.selectedImageIds = [];
 
+    controller.logEvent('step_generation_complete', { stepIndex: 1, generationMs: Date.now() - stepStart });
     controller.status = 'search_review';
     sendEvent('search_results', { results, images: [] });
     controller.addLog('Search complete. Pausing for user to review and confirm sources...');
@@ -448,6 +499,8 @@ Write a single web search query (under 120 characters) that will find the most u
       const screenshotImages = [];
       const seenImgUrls = new Set();
       let sIdx = 0;
+      // Use session prefix so screenshot IDs don't collide across sessions
+      const scrnshotPrefix = `${sessionId.slice(0, 8)}_scrn`;
 
       for (let pIdx = 0; pIdx < confirmed.length; pIdx++) {
         const source = confirmed[pIdx];
@@ -457,9 +510,8 @@ Write a single web search query (under 120 characters) that will find the most u
 
         const result = await scrapeOnePage(source.url);
 
-        // Store screenshot and push to list immediately
         if (result.screenshot) {
-          const sid = `scrn_${sIdx++}`;
+          const sid = `${scrnshotPrefix}_${sIdx++}`;
           screenshotStore.set(sid, result.screenshot);
           screenshotImages.push({
             id: sid,
@@ -470,7 +522,6 @@ Write a single web search query (under 120 characters) that will find the most u
           });
         }
 
-        // Accumulate regular page images
         for (const img of result.images || []) {
           if (!seenImgUrls.has(img.url)) {
             seenImgUrls.add(img.url);
@@ -478,14 +529,12 @@ Write a single web search query (under 120 characters) that will find the most u
           }
         }
 
-        // Build current image list and push to frontend immediately —
-        // screenshots accumulate one-by-one as each page is scraped
         const sortedRegular = [...allImages]
           .sort((a, b) => (b.width * b.height) - (a.width * a.height))
           .slice(0, 15)
           .map((img, i) => ({
             id: `page_img_${i}`,
-            url: img.data_url || img.url,  // prefer locally-downloaded base64
+            url: img.data_url || img.url,
             description: img.alt || '',
             width: img.width,
             height: img.height,
@@ -496,10 +545,8 @@ Write a single web search query (under 120 characters) that will find the most u
         controller.selectedImageIds = currentImages.map(i => i.id);
         sendEvent('page_images', { images: currentImages });
 
-        // Log page visit for analytics
         controller.logEvent('page_visited', { url: source.url, title: result.title || source.title || source.source || '' });
 
-        // Show screenshot in BrowserView (inline base64 renders immediately)
         sendEvent('browser_screenshot', {
           url: source.url,
           title: result.title || source.title,
@@ -507,7 +554,6 @@ Write a single web search query (under 120 characters) that will find the most u
           status: 'done',
         });
 
-        // Keep screenshot visible before moving to next page
         await new Promise(r => setTimeout(r, 800));
       }
 
@@ -517,7 +563,6 @@ Write a single web search query (under 120 characters) that will find the most u
     controller.status = 'running';
     sendEvent('step_complete', { stepIndex: 1, selectedSources: confirmed });
 
-    // In synchronous mode, pause after search so user can review scraped images before writing
     if (controller.config.executionMode === 'synchronous') {
       controller.status = 'waiting_approval';
       sendEvent('waiting_approval', { stepIndex: 1 });
@@ -539,7 +584,7 @@ Write a single web search query (under 120 characters) that will find the most u
 // ─────────────────────────────────────────────────────────────
 // Step: Writing (introduction / body / conclusion)
 // ─────────────────────────────────────────────────────────────
-async function executeWriting(section) {
+async function executeWriting(section, controller, sendEvent) {
   const stepIndexMap = { introduction: 2, body: 3, conclusion: 4 };
   const labelMap     = { introduction: 'Introduction', body: 'Body', conclusion: 'Conclusion' };
   const stepIndex    = stepIndexMap[section];
@@ -627,6 +672,7 @@ Target audience: ${targetAudience}`;
     { role: 'user',   content: userPrompt },
   ];
 
+  const stepStart = Date.now();
   try {
     let sectionText = '';
 
@@ -636,7 +682,7 @@ Target audience: ${targetAudience}`;
       sendEvent('multi_agent_start', { agent: 'writer', stepIndex });
       controller.addLog(`Writer Agent is drafting the ${section} section...`);
 
-      const draft = await streamCall(messages, delta => {
+      const draft = await streamCall(controller, messages, delta => {
         sectionText += delta;
         sendEvent('token', { section, text: delta, agent: 'writer' });
       });
@@ -649,7 +695,6 @@ Target audience: ${targetAudience}`;
         sendEvent('step_status', { stepIndex, message: `Reviewing ${label}… (Reviewer Agent)` });
         sendEvent('multi_agent_start', { agent: 'reviewer', stepIndex });
 
-        // Reset streaming buffer for this section
         sendEvent('section_reset', { section });
         sectionText = '';
 
@@ -666,7 +711,7 @@ Target audience: ${targetAudience}`;
           { role: 'user', content: `Improve this ${section} draft:\n\n${draft}` },
         ];
 
-        const refined = await streamCall(reviewMsgs, delta => {
+        const refined = await streamCall(controller, reviewMsgs, delta => {
           sectionText += delta;
           sendEvent('token', { section, text: delta, agent: 'reviewer' });
         });
@@ -679,7 +724,7 @@ Target audience: ${targetAudience}`;
       sendEvent('step_status', { stepIndex, message: `Writing ${label}...` });
       controller.addLog(`Agent is writing the ${section} section...`);
 
-      const result = await streamCall(messages, delta => {
+      const result = await streamCall(controller, messages, delta => {
         sectionText += delta;
         sendEvent('token', { section, text: delta });
       });
@@ -687,7 +732,6 @@ Target audience: ${targetAudience}`;
       if (result === null) return false;
     }
 
-    // Parse into paragraphs
     if (sectionText) {
       const paragraphs = sectionText
         .split(/\n\n+/)
@@ -700,6 +744,7 @@ Target audience: ${targetAudience}`;
       controller.addLog(`Draft complete for ${label} section.`);
     }
 
+    controller.logEvent('step_generation_complete', { stepIndex, generationMs: Date.now() - stepStart });
     sendEvent('step_complete', { stepIndex });
 
     if (controller.config.executionMode === 'synchronous') {
@@ -722,7 +767,7 @@ Target audience: ${targetAudience}`;
 // ─────────────────────────────────────────────────────────────
 // Step: Review
 // ─────────────────────────────────────────────────────────────
-async function executeReview() {
+async function executeReview(controller, sendEvent) {
   sendEvent('step_status', { stepIndex: 5, message: 'Reviewing the complete document...' });
   controller.addLog('Agent is reviewing the complete document...');
 
@@ -774,15 +819,17 @@ Format:
     },
   ];
 
+  const stepStart = Date.now();
   try {
     // ── Phase 1: Generate feedback ────────────────────────────
     let feedbackText = '';
-    const feedbackResult = await streamCall(feedbackMessages, delta => {
+    const feedbackResult = await streamCall(controller, feedbackMessages, delta => {
       feedbackText += delta;
       sendEvent('token', { section: 'review', text: delta });
     });
 
     if (feedbackResult === null) return false;
+    controller.logEvent('step_generation_complete', { stepIndex: 5, generationMs: Date.now() - stepStart });
     controller.addLog('Review feedback complete. Waiting for user to decide whether to apply suggestions…');
 
     // ── Pause: ask user whether to apply suggestions ──────────
@@ -793,7 +840,6 @@ Format:
       const res = await controller.waitForApproval();
       if (res.action === 'stop') return false;
       if (res.action === 'skip') {
-        // User chose not to apply suggestions
         sendEvent('step_complete', { stepIndex: 5, skipped: true });
         return true;
       }
@@ -837,7 +883,7 @@ Write the improved ${label}:`,
       ];
 
       let revised = '';
-      const reviseResult = await streamCall(reviseMsgs, delta => {
+      const reviseResult = await streamCall(controller, reviseMsgs, delta => {
         revised += delta;
         sendEvent('token', { section: key, text: delta });
       });
@@ -867,7 +913,7 @@ Write the improved ${label}:`,
 // ─────────────────────────────────────────────────────────────
 // Main agent runner
 // ─────────────────────────────────────────────────────────────
-async function runAgent(fromStep = 0) {
+async function runAgent(controller, sendEvent, sessionId, fromStep = 0) {
   controller.status = 'running';
   if (fromStep === 0) {
     sendEvent('agent_started', { steps: STEPS, config: controller.config });
@@ -878,12 +924,12 @@ async function runAgent(fromStep = 0) {
   }
 
   const stepFns = [
-    () => executePlanning(),
-    () => executeSearch(),
-    () => executeWriting('introduction'),
-    () => executeWriting('body'),
-    () => executeWriting('conclusion'),
-    () => executeReview(),
+    () => executePlanning(controller, sendEvent),
+    () => executeSearch(controller, sendEvent, sessionId),
+    () => executeWriting('introduction', controller, sendEvent),
+    () => executeWriting('body', controller, sendEvent),
+    () => executeWriting('conclusion', controller, sendEvent),
+    () => executeReview(controller, sendEvent),
   ];
 
   for (let i = fromStep; i < stepFns.length; i++) {
@@ -917,45 +963,75 @@ async function runAgent(fromStep = 0) {
 // Routes
 // ─────────────────────────────────────────────────────────────
 
-// SSE endpoint
+// SSE endpoint — each client connects with its own sessionId
 app.get('/api/stream', (req, res) => {
+  const sessionId = req.query.sessionId;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
   res.flushHeaders();
 
-  sseClient = res;
-  sendEvent('connected', { state: controller.getState() });
+  const session = getOrCreateSession(sessionId);
+  if (session.cleanupTimer) { clearTimeout(session.cleanupTimer); session.cleanupTimer = null; }
+  session.sseClient = res;
 
-  req.on('close', () => { if (sseClient === res) sseClient = null; });
+  // Send current state so reconnecting clients can restore UI
+  session.sendEvent('connected', { state: session.controller.getState() });
+
+  req.on('close', () => {
+    if (session.sseClient === res) {
+      session.sseClient = null;
+      scheduleSessionCleanup(sessionId);
+    }
+  });
 });
 
 app.post('/api/start', async (req, res) => {
+  const sessionId = req.query.sessionId || req.body?.sessionId;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+  const session = getOrCreateSession(sessionId);
+  const { controller, sendEvent } = session;
+
   if (controller._executing) return res.status(400).json({ error: 'Already running' });
+
+  // Reset all state so previous runs don't bleed into the new one
+  controller.reset();
   controller.config = req.body;
   controller._executing = true;
   controller._sessionStartTime = Date.now();
   controller.logEvent('session_start', { prompt: req.body.prompt?.substring(0, 200) });
   res.json({ success: true });
-  runAgent().finally(() => { controller._executing = false; });
+  runAgent(controller, sendEvent, sessionId).finally(() => { controller._executing = false; });
 });
 
 app.post('/api/stop', (req, res) => {
-  controller.pause();
+  const session = requireSession(req, res);
+  if (!session) return;
+  session.controller.pause();
   res.json({ success: true });
 });
 
 app.post('/api/resume', (req, res) => {
-  controller.resume();
+  const session = requireSession(req, res);
+  if (!session) return;
+  session.controller.resume();
   res.json({ success: true });
 });
 
 app.post('/api/skip', (req, res) => {
-  controller.skip();
+  const session = requireSession(req, res);
+  if (!session) return;
+  session.controller.skip();
   res.json({ success: true });
 });
 
 app.post('/api/approve', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const { controller, sendEvent } = session;
   controller.approve();
   controller.status = 'running';
   sendEvent('status_update', { status: 'running', currentStep: controller.currentStep });
@@ -963,13 +1039,18 @@ app.post('/api/approve', (req, res) => {
 });
 
 app.post('/api/inject', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
   const { instructions } = req.body;
   if (!instructions) return res.status(400).json({ error: 'No instructions' });
-  controller.injectInstructions(instructions);
+  session.controller.injectInstructions(instructions);
   res.json({ success: true });
 });
 
 app.post('/api/search/confirm', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const { controller } = session;
   const { selectedIds, selectedImageIds } = req.body;
   const waitMs = controller._approvalStartTime ? Date.now() - controller._approvalStartTime : null;
   controller.logEvent('search_confirmed', {
@@ -981,27 +1062,63 @@ app.post('/api/search/confirm', (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/search/retry', (req, res) => {
+  const sessionId = req.query.sessionId || req.body?.sessionId;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+  const session = getOrCreateSession(sessionId);
+  const { controller, sendEvent } = session;
+  const config = { ...controller.config };
+  controller.abort();
+  controller._executing = false;
+  setTimeout(() => {
+    controller._stopFlag = false;
+    controller._skipFlag = false;
+    controller.pendingInstructions = [];
+    controller._resumeResolvers = [];
+    controller._approvalResolver = null;
+    controller._searchResolver = null;
+    controller.searchResults = [];
+    controller.searchImages = [];
+    controller.selectedSourceIds = [];
+    controller.selectedImageIds = [];
+    controller.status = 'running';
+    controller.config = config;
+    controller._executing = true;
+    runAgent(controller, sendEvent, sessionId, 1).finally(() => { controller._executing = false; });
+  }, 200);
+  res.json({ success: true });
+});
+
 app.post('/api/document/edit', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
   const { section, paragraphId, text } = req.body;
-  controller.logEvent('paragraph_edited', { section });
-  controller.editParagraph(section, paragraphId, text);
+  session.controller.logEvent('paragraph_edited', { section });
+  session.controller.editParagraph(section, paragraphId, text);
   res.json({ success: true });
 });
 
 app.post('/api/document/remove', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
   const { section, paragraphId } = req.body;
   if (!section || !paragraphId) return res.status(400).json({ error: 'section and paragraphId required' });
-  const arr = controller.document[section];
-  if (arr) controller.document[section] = arr.filter(p => p.id !== paragraphId);
+  const arr = session.controller.document[section];
+  if (arr) session.controller.document[section] = arr.filter(p => p.id !== paragraphId);
   res.json({ success: true });
 });
 
 app.post('/api/document/rewrite', async (req, res) => {
+  const sessionId = req.query.sessionId || req.body?.sessionId;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+  const session = getOrCreateSession(sessionId);
+  const { controller, sendEvent } = session;
   const { section, paragraphId, instruction, originalText } = req.body;
   if (!section || !paragraphId) return res.status(400).json({ error: 'section and paragraphId required' });
   controller.logEvent('paragraph_rewrite_requested', { section, instruction: instruction?.substring(0, 200) || null });
 
-  // Use server-state text if available, fall back to originalText sent by the client
   const arr = controller.document[section];
   const para = arr?.find(p => p.id === paragraphId);
   const textToRewrite = para?.text || originalText;
@@ -1028,6 +1145,7 @@ Rewrite this paragraph.`;
   let full = '';
   try {
     await streamCall(
+      controller,
       [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
       delta => {
         full += delta;
@@ -1035,12 +1153,10 @@ Rewrite this paragraph.`;
       }
     );
     const trimmed = full.trim();
-    // Update server state if the paragraph still exists there
     if (trimmed && para) {
       const idx = arr.findIndex(p => p.id === paragraphId);
       if (idx !== -1) arr[idx].text = trimmed;
     }
-    // Always notify the client so it can unblock the UI
     sendEvent('paragraph_updated', { section, paragraphId, text: trimmed || textToRewrite });
   } catch (err) {
     console.error('Rewrite error:', err);
@@ -1049,6 +1165,11 @@ Rewrite this paragraph.`;
 });
 
 app.post('/api/restart', (req, res) => {
+  const sessionId = req.query.sessionId || req.body?.sessionId;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+  const session = getOrCreateSession(sessionId);
+  const { controller, sendEvent } = session;
   const config = controller.config;
   controller.abort();
   controller._executing = false;
@@ -1061,6 +1182,11 @@ app.post('/api/restart', (req, res) => {
 });
 
 app.post('/api/reset', (req, res) => {
+  const sessionId = req.query.sessionId || req.body?.sessionId;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+  const session = getOrCreateSession(sessionId);
+  const { controller, sendEvent } = session;
   controller.abort();
   controller._executing = false;
   setTimeout(() => {
@@ -1071,6 +1197,11 @@ app.post('/api/reset', (req, res) => {
 });
 
 app.post('/api/restart-from', (req, res) => {
+  const sessionId = req.query.sessionId || req.body?.sessionId;
+  if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+
+  const session = getOrCreateSession(sessionId);
+  const { controller, sendEvent } = session;
   const { stepIndex, prompt } = req.body;
   if (stepIndex === undefined) return res.status(400).json({ error: 'stepIndex required' });
   const config = { ...controller.config };
@@ -1080,7 +1211,6 @@ app.post('/api/restart-from', (req, res) => {
   controller._executing = false;
 
   setTimeout(() => {
-    // Partial state reset — clear data for stepIndex and beyond
     controller._stopFlag = false;
     controller._skipFlag = false;
     controller.pendingInstructions = [];
@@ -1090,48 +1220,56 @@ app.post('/api/restart-from', (req, res) => {
     controller.status = 'running';
     controller.config = config;
 
-    if (stepIndex <= 0) {
-      controller.outline = null;
-    }
+    // Drop analytics events belonging to restarted steps so times don't accumulate.
+    const stepEvents = new Set(['step_generation_complete', 'step_approved', 'step_skipped']);
+    const searchEvents = new Set(['search_confirmed', 'page_visited', 'external_link_clicked']);
+    controller.analyticsLog = controller.analyticsLog.filter(e => {
+      if (stepEvents.has(e.type) && e.stepIndex >= stepIndex) return false;
+      if (searchEvents.has(e.type) && stepIndex <= 1) return false;
+      return true;
+    });
+
+    if (stepIndex <= 0) { controller.outline = null; }
     if (stepIndex <= 1) {
       controller.searchResults = [];
       controller.searchImages = [];
       controller.selectedSourceIds = [];
       controller.selectedImageIds = [];
     }
-    if (stepIndex <= 2) {
-      controller.document.introduction = [];
-    }
-    if (stepIndex <= 3) {
-      controller.document.body = [];
-    }
-    if (stepIndex <= 4) {
-      controller.document.conclusion = [];
-    }
+    if (stepIndex <= 2) { controller.document.introduction = []; }
+    if (stepIndex <= 3) { controller.document.body = []; }
+    if (stepIndex <= 4) { controller.document.conclusion = []; }
 
     controller._executing = true;
-    runAgent(stepIndex).finally(() => { controller._executing = false; });
+    runAgent(controller, sendEvent, sessionId, stepIndex).finally(() => { controller._executing = false; });
   }, 200);
 
   res.json({ success: true });
 });
 
 app.post('/api/update-prompt', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
   const { prompt } = req.body;
   if (!prompt) return res.status(400).json({ error: 'prompt required' });
-  if (controller.config) controller.config.prompt = prompt;
+  if (session.controller.config) session.controller.config.prompt = prompt;
   res.json({ success: true });
 });
 
 app.post('/api/personas', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
   const { personas } = req.body;
   if (!personas || typeof personas !== 'object') return res.status(400).json({ error: 'Invalid personas' });
-  controller.logEvent('persona_edited', { agents: Object.keys(personas) });
-  if (controller.config) controller.config.personas = { ...(controller.config.personas || {}), ...personas };
+  session.controller.logEvent('persona_edited', { agents: Object.keys(personas) });
+  if (session.controller.config) session.controller.config.personas = { ...(session.controller.config.personas || {}), ...personas };
   res.json({ success: true });
 });
 
 app.post('/api/plan/update', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const { controller } = session;
   if (!controller.outline) return res.status(400).json({ error: 'No active outline' });
   const allowed = ['sections', 'introduction_points', 'conclusion_points', 'writing_style', 'target_audience', 'topic'];
   const changedKeys = allowed.filter(k => req.body[k] !== undefined);
@@ -1140,8 +1278,11 @@ app.post('/api/plan/update', (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/api/state', (req, res) => res.json(controller.getState()));
-
+app.get('/api/state', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
+  res.json(session.controller.getState());
+});
 
 app.get('/api/screenshot/:id', (req, res) => {
   const dataUrl = screenshotStore.get(req.params.id);
@@ -1156,20 +1297,26 @@ app.get('/api/screenshot/:id', (req, res) => {
 // ── Analytics ────────────────────────────────────────────────
 
 app.post('/api/analytics/event', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
   const { type, ...payload } = req.body;
   if (!type) return res.status(400).json({ error: 'type required' });
-  controller.logEvent(type, payload);
+  session.controller.logEvent(type, payload);
   res.json({ success: true });
 });
 
 const STEP_NAMES = ['Planning', 'Web Search', 'Introduction', 'Body', 'Conclusion', 'Review'];
 
 app.get('/api/analytics', (req, res) => {
+  const session = requireSession(req, res);
+  if (!session) return;
+  const { controller } = session;
+
   const log = controller.analyticsLog;
   const sessionStart = controller._sessionStartTime;
   const now = Date.now();
+  const sessionCompleteEvent = log.find(e => e.type === 'session_complete');
 
-  // --- Computed summary ---
   const approvals  = log.filter(e => e.type === 'step_approved');
   const skips      = log.filter(e => e.type === 'step_skipped');
   const pauses     = log.filter(e => e.type === 'agent_paused');
@@ -1193,18 +1340,21 @@ app.get('/api/analytics', (req, res) => {
   const rewritesBySection = { introduction: 0, body: 0, conclusion: 0 };
   rewrites.forEach(e => { if (rewritesBySection[e.section] !== undefined) rewritesBySection[e.section]++; });
 
+  const generationEvents = log.filter(e => e.type === 'step_generation_complete');
   const stepBreakdown = STEP_NAMES.map((name, i) => {
-    const approved = approvals.find(e => e.stepIndex === i);
-    const skipped  = skips.find(e => e.stepIndex === i);
+    const approved    = approvals.find(e => e.stepIndex === i);
+    const skipped     = skips.find(e => e.stepIndex === i);
+    const genEvent    = generationEvents.find(e => e.stepIndex === i);
     return {
       step: i, name,
       outcome: approved ? 'approved' : skipped ? 'skipped' : 'pending',
+      generationMs: genEvent?.generationMs ?? null,
       reviewWaitMs: (approved || skipped)?.waitMs ?? null,
     };
   });
 
   const summary = {
-    sessionDurationMs: sessionStart ? now - sessionStart : null,
+    sessionDurationMs: sessionCompleteEvent?.durationMs ?? (sessionStart ? now - sessionStart : null),
     prompt: controller.config?.prompt?.substring(0, 300) || null,
 
     steps: stepBreakdown,
